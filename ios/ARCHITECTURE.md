@@ -195,13 +195,18 @@ ViewModels may:
 
 - Expose `@Published private(set)` state.
 - Map use case outputs or feature results into renderable state.
-- Own simple form state.
+- Own editable draft state for a screen.
+- Receive field-change intents that update editable draft state.
 - Emit small screen events to a parent.
 - Use presentation collaborators, such as formatters.
 
 ViewModels must not:
 
 - Create concrete repositories, API clients, databases, or SDKs.
+- Call use cases or repositories to perform application operations.
+- Submit forms.
+- Validate operation rules.
+- Map editable drafts into application commands.
 - Decide navigation routes.
 - Know `NavigationPath`, `NavController`, UIKit navigation controllers, or app-level route strings.
 - Own analytics policy by default.
@@ -230,7 +235,7 @@ final class ProductsViewModel: ObservableObject, LoadProductsOutput {
 }
 ```
 
-Small-feature exception: a ViewModel may call a use case directly when the feature is tiny and there is no meaningful composition pressure. Do not use this exception if the ViewModel also owns analytics, navigation, persistence policy, error interpretation, and formatting policy.
+Views may call ViewModel methods for presentation intents, such as field changes or local UI actions that update renderable state. Views must not call ViewModel methods that perform application operations, such as `submit()`, `loadProducts()`, `placeOrder()`, or `login()`.
 
 ## Use Case Rules
 
@@ -662,6 +667,180 @@ Rules:
 - Pass `Product` when detail is a continuation of already-loaded data.
 - Use a row-ID lookup only when selection must use the latest domain object or row closures are inappropriate.
 
+## Complex Form Rules
+
+Complex forms need explicit boundaries. Do not let the ViewModel become the form operation.
+
+Use these roles:
+
+- `FormDraft`: UI-specific editable state for one form experience.
+- `ViewState`: renderable data derived from draft, validation, loading, and output events.
+- `Validator`: decides whether a draft can be submitted.
+- `CommandMapper`: maps a draft into application operation input.
+- `FormOperation`: coordinates validation, mapping, use case execution, and output reporting.
+- `UseCase`: performs the application operation.
+- `ViewModel`: owns draft editing and maps outputs into render state.
+- `Flow`: owns navigation after form completion.
+
+The draft belongs to the UI. The command belongs to the operation.
+
+Different UIs may have different draft models that map to the same command:
+
+```swift
+struct FullCheckoutDraft: Equatable {
+    var street: String
+    var city: String
+    var postalCode: String
+    var useShippingAsBilling: Bool
+    var acceptsTerms: Bool
+}
+
+struct ExpressCheckoutDraft: Equatable {
+    var selectedAddressID: String?
+    var selectedPaymentMethodID: String?
+    var acceptsTerms: Bool
+}
+
+struct PlaceOrderCommand: Equatable {
+    let shippingAddress: Address
+    let billingAddress: Address
+    let paymentMethodID: PaymentMethod.ID
+    let acceptsTerms: Bool
+}
+```
+
+The ViewModel may own and update the draft:
+
+```swift
+@MainActor
+final class CheckoutViewModel: ObservableObject, CheckoutFormOutput {
+    @Published private(set) var state: CheckoutViewState
+
+    private var draft: FullCheckoutDraft
+
+    var currentDraft: FullCheckoutDraft {
+        draft
+    }
+
+    init(draft: FullCheckoutDraft) {
+        self.draft = draft
+        self.state = CheckoutViewState(draft: draft)
+    }
+
+    func update(_ change: CheckoutFieldChange) {
+        draft = draft.applying(change)
+        state = CheckoutViewState(draft: draft)
+    }
+
+    func checkoutValidationFailed(_ validation: CheckoutValidation) {
+        state = CheckoutViewState(
+            draft: draft,
+            validation: validation
+        )
+    }
+
+    func checkoutSubmissionStarted() {
+        state = state.submitting()
+    }
+
+    func checkoutSubmissionFailed(_ message: String) {
+        state = state.failed(message)
+    }
+
+    func checkoutSubmissionSucceeded() {
+        state = state.succeeded()
+    }
+}
+```
+
+The ViewModel must not have a `submit()` method. Submitting is not a presentation-state update.
+
+Use a form operation:
+
+```swift
+final class SubmitCheckoutForm {
+    private let validator: CheckoutDraftValidating
+    private let mapper: CheckoutCommandMapping
+    private let placeOrder: PlaceOrderUseCase
+    private weak var output: CheckoutFormOutput?
+
+    init(
+        validator: CheckoutDraftValidating,
+        mapper: CheckoutCommandMapping,
+        placeOrder: PlaceOrderUseCase,
+        output: CheckoutFormOutput
+    ) {
+        self.validator = validator
+        self.mapper = mapper
+        self.placeOrder = placeOrder
+        self.output = output
+    }
+
+    func execute(_ draft: FullCheckoutDraft) async {
+        let validation = validator.validate(draft)
+
+        guard validation.isValid else {
+            await MainActor.run {
+                output?.checkoutValidationFailed(validation)
+            }
+            return
+        }
+
+        let command = mapper.command(from: draft)
+
+        await MainActor.run {
+            output?.checkoutSubmissionStarted()
+        }
+
+        do {
+            try await placeOrder.execute(command)
+
+            await MainActor.run {
+                output?.checkoutSubmissionSucceeded()
+            }
+        } catch {
+            await MainActor.run {
+                output?.checkoutSubmissionFailed(
+                    "Could not place your order."
+                )
+            }
+        }
+    }
+}
+```
+
+The route wires the current draft into the submit intent:
+
+```swift
+struct CheckoutRoute: View {
+    @ObservedObject var viewModel: CheckoutViewModel
+    let onSubmit: (FullCheckoutDraft) async -> Void
+
+    var body: some View {
+        CheckoutView(
+            state: viewModel.state,
+            onChange: viewModel.update,
+            onSubmit: {
+                await onSubmit(viewModel.currentDraft)
+            }
+        )
+    }
+}
+```
+
+Rules:
+
+- Do not use the domain model as form state unless the UI truly edits that exact shape.
+- Do not add submit/load/save methods to ViewModels.
+- Do not validate operation rules inside ViewModels.
+- Do not map drafts into commands inside ViewModels.
+- Do not make factories interpret form completion or navigation events.
+- Do not pass half-edited UI strings into use cases.
+- Test draft editing in ViewModel tests.
+- Test validation in validator tests.
+- Test draft-to-command mapping in mapper tests.
+- Test submit coordination in form-operation tests.
+
 ## Adapters And Decorators
 
 An adapter should adapt something. It should translate language or hide a detail.
@@ -728,7 +907,7 @@ Prefer decorators when analytics/logging/retry/caching should be added without p
 
 ## Formatting Rules
 
-Formatting can live in the ViewModel when it is simple display mapping.
+ViewModels may produce renderable strings and values as part of mapping outputs into view state.
 
 If formatting has policy, localization complexity, experiments, business rules, or reuse pressure, give it a collaborator:
 
@@ -955,6 +1134,10 @@ If the answers are strong, the boundary is probably doing useful work.
 Avoid:
 
 - ViewModels that create repositories or API clients.
+- ViewModels that call use cases or repositories to perform operations.
+- ViewModels with submit/load/save methods for application operations.
+- ViewModels that validate form submission rules.
+- ViewModels that map form drafts into operation commands.
 - ViewModels that own app navigation.
 - Factories that interpret screen events.
 - Use cases that only forward without meaning.
@@ -980,6 +1163,7 @@ When generating or modifying code, do not:
 - Add `Manager`, `Helper`, or `Service` names when a more specific responsibility is known.
 - Convert every repository call into a use case when there is no operation-level behavior.
 - Hide app behavior in SwiftUI modifiers that make the feature hard to trace.
+- Add ViewModel operation methods because the operation looks short.
 
 When the user asks for speed or a small fix, still keep these boundaries honest. A smaller implementation is fine; a hidden dependency direction is not.
 
@@ -988,11 +1172,11 @@ When the user asks for speed or a small fix, still keep these boundaries honest.
 Use these defaults when Claude Code must choose:
 
 - New non-trivial feature: create a feature factory, ViewModel, render state, use case if operation has policy, repository if data policy exists.
+- Complex form: use a UI-specific draft, validator, command mapper, form operation, use case, output, and flow-owned navigation.
 - SwiftUI list selection: use `ProductUIState` plus `SelectableProductRow`.
 - Detail navigation: use ID if detail reloads/restores/deep-links; use model if detail continues from loaded data.
 - Analytics: prefer output decorators or operation-level decorators over ViewModel calls.
 - Formatting: use a formatter collaborator when formatting has policy.
-- Small/simple feature: use fewer types, but keep dependency direction honest.
 - Existing codebase: follow local patterns unless they conflict with these rules and the task requires correction.
 
 ## Final Check Before Finishing
